@@ -114,7 +114,7 @@
     }
   }
 
-  .dynamic-property {
+  .dynamic-property, .non-existent-property {
     display: flex;
     align-items: center;
     margin-bottom: 10px;
