@@ -84,9 +84,7 @@ export class FlowDatabase {
     if (id && !id.match(/^[0-9a-zA-Z_-]+$/)) {
       throw new Error(`Invalid flow id: ${id}`);
     }
-    if (fs.existsSync(path.join(SERIALIZED_FLOW_DIR, id))) {
-      throw new Error(`Flow is already serialized id: "${id}"`);
-    }
+    // Allow re-serialization (overwrite existing)
     const flow = await new Promise<Buffer|null>((resolve, reject)=>{
       fs.readFile(path.join(FLOW_DIR, id), (err, data)=>{
         if (err) {

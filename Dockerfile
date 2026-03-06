@@ -7,4 +7,5 @@ COPY . .
 RUN npm run build-server
 RUN npm run build-website
 
-ENTRYPOINT npm run server -- --port 13405
+EXPOSE 13405
+ENTRYPOINT ["node", "server/build/index.js", "--port", "13405"]

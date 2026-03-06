@@ -66,7 +66,10 @@ async function main() {
   });
 
   app.use((err: any, req: Request, res: Response, next: NextFunction)=>{
-    debugger;
+    console.error(`Error handling ${req.method} ${req.path}:`, err?.message ?? err);
+    if (!res.headersSent) {
+      res.status(500).json({error: err?.message ?? "Internal server error"});
+    }
   })
 
   const PORT = (()=>{

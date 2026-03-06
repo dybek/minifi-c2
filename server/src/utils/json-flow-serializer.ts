@@ -58,6 +58,13 @@ export function SerializeFlowToJson(id: string, flow: FlowObject): string {
 function serializeProcessGroup(id: Uuid | null, flow: FlowObject): object {
     const group = flow.processGroups?.find(group => group.id === id);
     const child_groups = flow.processGroups?.filter(group => group.parentGroup === id) ?? [];
+    // Collect RPG port IDs to exclude from regular inputPorts/outputPorts
+    const rpgPortIds = new Set<string>();
+    for (const rpg of flow.remoteProcessGroups.filter(val => (val.parentGroup ?? null) === id)) {
+        for (const port of (flow.processGroupsPorts ?? []).filter(p => (p as any)._rpgId === rpg.id)) {
+            rpgPortIds.add(port.id as string);
+        }
+    }
     const result = {
         "identifier": id,
         "name": group?.name ?? "MiNiFi Flow",
@@ -88,13 +95,13 @@ function serializeProcessGroup(id: Uuid | null, flow: FlowObject): object {
                 "version": flow.manifest.processors.find(proc_info => proc_info.type === proc.type)?.version ?? "unknown",
             }
         })),
-        "inputPorts": (flow.processGroupsPorts ?? []).filter(port => port.type === 'INPUT' && port.parentGroup === id).map(port => {
+        "inputPorts": (flow.processGroupsPorts ?? []).filter(port => port.type === 'INPUT' && port.parentGroup === id && !rpgPortIds.has(port.id as string)).map(port => {
             return {
                 "identifier": port.id,
                 "name": port.name
             }
         }),
-        "outputPorts": (flow.processGroupsPorts ?? []).filter(port => port.type === 'OUTPUT' && port.parentGroup === id).map(port => {
+        "outputPorts": (flow.processGroupsPorts ?? []).filter(port => port.type === 'OUTPUT' && port.parentGroup === id && !rpgPortIds.has(port.id as string)).map(port => {
             return {
                 "identifier": port.id,
                 "name": port.name
@@ -105,6 +112,7 @@ function serializeProcessGroup(id: Uuid | null, flow: FlowObject): object {
                 || flow.funnels.find(val => val.parentGroup === id && (val.id === conn.source.id || val.id === conn.destination.id))
                 || flow.processGroupsPorts?.find(val => val.type === 'OUTPUT' && val.id === conn.source.id && child_groups.find(child_group => child_group.id === val.parentGroup))
                 || flow.processGroupsPorts?.find(val => val.type === 'INPUT' && val.id === conn.destination.id && child_groups.find(child_group => child_group.id === val.parentGroup))
+                || flow.processGroupsPorts?.find(val => val.type === 'INPUT' && val.id === conn.destination.id)
         }).map(conn => {
             const src = findComponent(flow, conn.source.id)!;
             const dst = findComponent(flow, conn.destination.id)!;
@@ -137,7 +145,37 @@ function serializeProcessGroup(id: Uuid | null, flow: FlowObject): object {
             };
         }),
         "processGroups": child_groups.map(child_group => serializeProcessGroup(child_group.id, flow)),
-        "remoteProcessGroups": [],
+        "remoteProcessGroups": flow.remoteProcessGroups.filter(val => (val.parentGroup ?? null) === id).map(rpg => {
+            // Find RPG input ports from processGroupsPorts that were stored during deserialization
+            const rpgInputPorts = (flow.processGroupsPorts ?? []).filter(port =>
+                port.type === 'INPUT' && flow.connections.some(conn => conn.destination.id === port.id)
+            );
+            return {
+                "identifier": rpg.id,
+                "instanceIdentifier": rpg.id,
+                "name": rpg.url,
+                "targetUris": rpg.url,
+                "communicationsTimeout": rpg.connectionTimeout,
+                "yieldDuration": rpg.yield,
+                "transportProtocol": rpg.protocol,
+                "inputPorts": rpgInputPorts.map(port => ({
+                    "identifier": port.id,
+                    "instanceIdentifier": port.id,
+                    "name": port.name,
+                    "componentType": "REMOTE_INPUT_PORT",
+                    "remoteGroupId": rpg.id,
+                    "concurrentlySchedulableTaskCount": 1,
+                    "useCompression": false,
+                    "batchCount": 0,
+                })),
+                "outputPorts": [],
+                "componentType": "REMOTE_PROCESS_GROUP",
+                "position": {"x": rpg.position.x, "y": rpg.position.y},
+                "proxyHost": rpg.proxy?.host ?? "",
+                "proxyPort": rpg.proxy?.port ?? "",
+                "localNetworkInterface": rpg.localNetworkInterface ?? "",
+            };
+        }),
         "funnels": flow.funnels.filter(val => val.parentGroup === id).map(funnel => {
             return {
                 "identifier": funnel.id,
@@ -348,6 +386,37 @@ function deserializeProcessGroup(flow_object: FlowObject, group_id: Uuid | null,
                 parentGroup: group_id,
             })));
         }
+        if (process_group_json.remoteProcessGroups) {
+            for (let rpg of process_group_json.remoteProcessGroups) {
+                flow_object.remoteProcessGroups.push({
+                    position: {
+                        x: rpg.position?.x ?? 0,
+                        y: rpg.position?.y ?? 0,
+                    },
+                    id: rpg.identifier,
+                    url: rpg.targetUris ?? rpg.targetUri ?? "",
+                    protocol: rpg.transportProtocol === "RAW" ? "RAW" : "HTTP",
+                    proxy: {host: rpg.proxyHost ?? "", port: rpg.proxyPort ?? 0},
+                    localNetworkInterface: rpg.localNetworkInterface ?? "",
+                    connectionTimeout: rpg.communicationsTimeout ?? "30 sec" as any,
+                    yield: rpg.yieldDuration ?? "10 sec" as any,
+                    parentGroup: group_id,
+                });
+                // Add RPG input ports as processGroupsPorts so connections can resolve in UI
+                if (rpg.inputPorts) {
+                    flow_object.processGroupsPorts = flow_object.processGroupsPorts?.concat(rpg.inputPorts.map((port: any) => ({
+                        position: {x: 0, y: 0},
+                        parentGroup: group_id,
+                        type: 'INPUT' as const,
+                        side: null,
+                        id: port.identifier,
+                        name: port.name,
+                        properties: {},
+                        _rpgId: rpg.identifier,
+                    } as any)));
+                }
+            }
+        }
         for (let child_process_group of process_group_json.processGroups) {
             deserializeProcessGroup(flow_object, child_process_group.identifier, group_id, child_process_group);
         }
@@ -362,7 +431,7 @@ function fixFlowObject(flow_object: FlowObject) {
         if (processor_manifest && processor_manifest.propertyDescriptors) {
             for (let property_name in processor_manifest.propertyDescriptors) {
                 if (!(property_name in processor.properties)) {
-                    processor.properties[property_name] = null;
+                    processor.properties[property_name] = processor_manifest.propertyDescriptors[property_name].defaultValue ?? null;
                 }
             }
         }
@@ -379,11 +448,34 @@ function fixFlowObject(flow_object: FlowObject) {
         if (service_manifest && service_manifest.propertyDescriptors) {
             for (let property_name in service_manifest.propertyDescriptors) {
                 if (!(property_name in service.properties)) {
-                    service.properties[property_name] = null;
+                    service.properties[property_name] = service_manifest.propertyDescriptors[property_name].defaultValue ?? null;
                 }
             }
         }
     }
+    // Auto-terminate relationships that are neither connected nor already auto-terminated
+    const connectedRels: {[procId: string]: Set<string>} = {};
+    for (let connection of flow_object.connections) {
+        const srcId = connection.source.id as string;
+        if (!connectedRels[srcId]) connectedRels[srcId] = new Set();
+        for (let rel in connection.sourceRelationships) {
+            if (connection.sourceRelationships[rel]) {
+                connectedRels[srcId].add(rel);
+            }
+        }
+    }
+    for (let processor of flow_object.processors) {
+        const processor_manifest = flow_object.manifest.processors.find(pm => pm.type === processor.type);
+        if (processor_manifest?.supportedRelationships) {
+            const connected = connectedRels[processor.id as string] ?? new Set();
+            for (let relationship of processor_manifest.supportedRelationships) {
+                if (!connected.has(relationship.name) && !processor.autoterminatedRelationships[relationship.name]) {
+                    processor.autoterminatedRelationships[relationship.name] = true;
+                }
+            }
+        }
+    }
+
     for (let connection of flow_object.connections) {
         const source_processor = flow_object.processors.find(processor => processor.id === connection.source.id);
         if (source_processor) {
